@@ -1,18 +1,17 @@
 """
 main.py — Bleacher Bot entry point.
 
-Orchestrates the full pipeline:
-  1. Load config
-  2. Scrape all three data sources
-  3. Build newsletter via parallel LLM calls
-  4. Deliver via email (or print if DRY_RUN=true)
+Pipeline:
+  1. Scrape  — fetch structured data from Google News RSS + Reddit
+  2. Compose — single LLM call produces JSON analysis (summaries, sentiment, war room)
+  3. Render  — JSON + scraper data → self-contained HTML dashboard
+  4. Deliver — send HTML as email attachment (or write preview file in DRY_RUN)
 """
 
 import logging
 import sys
 from datetime import datetime
 
-# Configure logging before any imports that use it
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
@@ -21,9 +20,9 @@ logging.basicConfig(
 logger = logging.getLogger("bleacher-bot")
 
 from src.config import TEAM, DRY_RUN
-from src.scrape import fetch_general_news, fetch_reddit_sentiment, fetch_offseason_news
-from src.compose import build_newsletter
-from src.deliver import send_email
+from src.scrape import fetch_general_news, fetch_reddit_data, fetch_offseason_news
+from src.compose import build_report
+from src.deliver import render_report, send_email
 
 
 def main() -> int:
@@ -33,47 +32,62 @@ def main() -> int:
 
     # ── Step 1: Scrape ─────────────────────────────────────────────────────
     logger.info("Scraping data sources...")
-    try:
-        general_news = fetch_general_news()
-        logger.info("  ✓ General news fetched")
-    except Exception as e:
-        logger.error(f"  ✗ General news failed: {e}")
-        general_news = "Could not retrieve general news this week."
 
     try:
-        reddit_sentiment = fetch_reddit_sentiment()
-        logger.info("  ✓ Reddit sentiment fetched")
+        general_news = fetch_general_news()
+        logger.info(f"  ✓ General news — {len(general_news['items'])} items")
+    except Exception as e:
+        logger.error(f"  ✗ General news failed: {e}")
+        general_news = {"items": [], "text_blob": "Could not retrieve general news this week."}
+
+    try:
+        reddit_data = fetch_reddit_data()
+        logger.info(f"  ✓ Reddit — {len(reddit_data['top_comments'])} top comments collected")
     except Exception as e:
         logger.error(f"  ✗ Reddit fetch failed: {e}")
-        reddit_sentiment = "Could not retrieve Reddit sentiment this week."
+        reddit_data = {"posts_text": "Could not retrieve Reddit data this week.", "top_comments": []}
 
     try:
         offseason_news = fetch_offseason_news()
-        logger.info("  ✓ Offseason/seasonal news fetched")
+        logger.info(f"  ✓ Offseason news — {len(offseason_news['items'])} items")
     except Exception as e:
         logger.error(f"  ✗ Offseason news failed: {e}")
-        offseason_news = "Could not retrieve offseason news this week."
+        offseason_news = {"items": [], "text_blob": "Could not retrieve offseason news this week."}
 
-    # ── Step 2: Compose ────────────────────────────────────────────────────
-    logger.info("Composing newsletter (3 parallel LLM calls)...")
+    # ── Step 2: Compose (single LLM call → ReportData) ────────────────────
+    logger.info("Composing report (LLM analysis)...")
     try:
-        newsletter = build_newsletter(
+        report = build_report(
             general_news=general_news,
-            reddit_sentiment=reddit_sentiment,
+            reddit_data=reddit_data,
             offseason_news=offseason_news,
         )
-        logger.info("  ✓ Newsletter composed")
+        logger.info("  ✓ Report data composed")
     except Exception as e:
-        logger.error(f"Newsletter composition failed: {e}")
+        logger.error(f"Report composition failed: {e}")
         return 1
 
-    # ── Step 3: Deliver ────────────────────────────────────────────────────
-    date_str = datetime.now().strftime("%B %d, %Y")
-    subject = f"🐬 {team_name} Weekly Brief — {date_str}"
-
-    logger.info("Delivering newsletter...")
+    # ── Step 3: Render (data → HTML) ───────────────────────────────────────
+    logger.info("Rendering HTML report...")
     try:
-        send_email(subject=subject, markdown_body=newsletter)
+        html = render_report(
+            report=report,
+            general_news=general_news,
+            reddit_data=reddit_data,
+            offseason_news=offseason_news,
+        )
+        logger.info("  ✓ HTML rendered")
+    except Exception as e:
+        logger.error(f"HTML rendering failed: {e}")
+        return 1
+
+    # ── Step 4: Deliver ────────────────────────────────────────────────────
+    date_str = datetime.now().strftime("%B %d, %Y")
+    subject  = f"🐬 {team_name} Weekly Brief — {date_str}"
+
+    logger.info("Delivering report...")
+    try:
+        send_email(subject=subject, html=html)
     except Exception as e:
         logger.error(f"Email delivery failed: {e}")
         return 1

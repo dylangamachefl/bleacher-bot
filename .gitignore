@@ -25,3 +25,8 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
+
+example.jsx
+
+# Claude AI
+.claude/

@@ -1,170 +1,249 @@
 """
-compose.py — Parallel LLM calls that assemble the three newsletter sections.
+compose.py — LLM call that produces the report's analytical content as JSON.
+
+The scrapers already return structured data (news items, reddit comments,
+etc.) for direct rendering. This module asks the LLM to produce only the
+things it's actually good at: prose summaries, sentiment scoring, and
+extracting signal from noisy text.
+
+Pydantic is used exclusively here to validate and coerce the LLM's JSON
+output — the one place in the pipeline where we receive untrusted,
+uncontrolled data that must match a known schema.
 """
 
+import json
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+from datetime import datetime
+
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.llm import GeminiClient
 from src.config import TEAM
+from src.scrape import NewsData, RedditData
 
 logger = logging.getLogger(__name__)
 
-# ── Section Prompts ──────────────────────────────────────────────────────────
 
-FRONT_PAGE_PROMPT = """You are a sports journalist writing the lead story for a weekly {team} newsletter.
+# ── Pydantic models for LLM output validation ─────────────────────────────────
 
-Your task: Read the news headlines and summaries provided below. Identify the single most
-significant story from that data and write a short news item covering it.
+class SentimentBreakdown(BaseModel):
+    positive: int = 33
+    neutral:  int = 34
+    negative: int = 33
 
-Output format — use exactly this structure:
-**[One sentence lede that states the core news clearly and directly.]**
-
-[Two to three sentences of context and detail drawn from the articles. What happened, who is
-involved, and why it matters for the team. Stay focused on the one story — do not pivot to
-other topics.]
-
-Rules:
-- Base your writing ONLY on the articles provided. Do not introduce facts, names, scores,
-  or storylines not present in the data below.
-- The bolded lede must be a standalone sentence that makes sense on its own.
-- Write in a clear, direct journalistic voice. Confident but not sensational.
-- Do not begin with "This week" or refer to yourself."""
-
-WATERCOOLER_PROMPT = """You are a writer summarizing fan sentiment for the weekly {team} newsletter.
-
-Your task: Read the Reddit posts and comments provided below. Write a short intro sentence
-capturing the overall mood, then pull out 2 to 3 of the most representative or interesting
-fan takes as blockquotes.
-
-Output format — use exactly this structure:
-[One sentence describing the dominant mood or topic in the community this week.]
-
-> "[Direct quote or close paraphrase of a specific fan comment from the data.]"
-> — *[brief descriptor, e.g. "top comment on the injury thread"]*
-
-> "[Direct quote or close paraphrase of a second fan comment from the data.]"
-> — *[brief descriptor]*
-
-[Optional: one closing sentence if there is a clear secondary theme worth noting.]
-
-Rules:
-- Base your writing ONLY on the posts and comments provided. Every blockquote must come
-  from actual content in the data below — do not invent quotes.
-- The descriptor after the em dash should identify the post or comment it came from
-  (e.g. "reply in the game thread", "top comment on the depth chart post").
-- Keep the intro sentence plain and observational. No hype.
-- Do not begin with "Reddit is buzzing" or similar generic openers."""
-
-WAR_ROOM_PROMPT = """You are an analyst writing the roster and front-office section of the weekly {team} newsletter.
-
-Your task: Read the news headlines and summaries provided below. Identify the key roster moves,
-contract news, injuries, draft talk, or strategic decisions and present them as a brief
-framing sentence followed by a short bullet list.
-
-Output format — use exactly this structure:
-[One sentence framing what the main front-office theme is this week.]
-
-- **[Item title]:** [One sentence summary of the move or news, drawn from the articles.]
-- **[Item title]:** [One sentence summary.]
-- **[Item title]:** [One sentence summary.]
-
-Rules:
-- Base your writing ONLY on the articles provided. Do not invent transactions, signings,
-  or rumors not present in the data below.
-- Include 2 to 4 bullet points depending on how much material the data supports. Do not
-  pad with generic observations if the data does not support them.
-- Each bullet should be self-contained and specific — player name, nature of the move, context.
-- Do not begin with "As the offseason" or other generic throat-clearing openers."""
+    @model_validator(mode="after")
+    def normalise_to_100(self) -> "SentimentBreakdown":
+        """Correct rounding errors so the three values always sum to 100."""
+        total = self.positive + self.neutral + self.negative
+        if total != 100 and total > 0:
+            self.positive = round(self.positive / total * 100)
+            self.neutral  = round(self.neutral  / total * 100)
+            self.negative = 100 - self.positive - self.neutral
+        return self
 
 
-# ── Section Builder ──────────────────────────────────────────────────────────
-
-def _build_section(client: GeminiClient, prompt_template: str, content: str) -> str:
-    """Formats the prompt for the current team and calls the LLM."""
-    prompt = prompt_template.format(team=TEAM["name"])
-    user_turn = (
-        "Here is the source data to base your writing on. "
-        "Do not use any information outside of what appears below.\n\n"
-        f"{content}"
-    )
-    return client.generate(system_prompt=prompt, user_content=user_turn)
+class WarRoomItem(BaseModel):
+    title:   str
+    summary: str
 
 
-# ── Newsletter Composer ──────────────────────────────────────────────────────
-
-def build_newsletter(
-    general_news: str,
-    reddit_sentiment: str,
-    offseason_news: str,
-) -> str:
+class LLMOutput(BaseModel):
     """
-    Fires three LLM calls in parallel via ThreadPoolExecutor and stitches
-    the results into a single Markdown newsletter document.
+    Validated schema for the JSON object returned by the LLM.
 
-    Args:
-        general_news:     Output of scrape.fetch_general_news()
-        reddit_sentiment: Output of scrape.fetch_reddit_sentiment()
-        offseason_news:   Output of scrape.fetch_offseason_news()
-
-    Returns:
-        Complete newsletter as a Markdown string.
+    Pydantic handles:
+      - Missing fields          → field defaults kick in, no KeyError
+      - Wrong types             → automatic coercion where safe ("82" → 82)
+      - Out-of-range score      → clamped to [0, 100] by the validator
+      - Breakdown not summing   → normalised to 100 by SentimentBreakdown
+      - Excess list items       → silently truncated by max_length
     """
-    client = GeminiClient()
-    team_name = TEAM["name"]
+    season_note:         str                = "Weekly Report"
+    executive_summary:   str                = ""
+    sentiment_score:     int                = 50
+    sentiment_label:     str                = "Neutral"
+    sentiment_trend:     str                = "Stable"
+    sentiment_breakdown: SentimentBreakdown = Field(default_factory=SentimentBreakdown)
+    sentiment_keywords:  list[str]          = Field(default_factory=list)
+    war_room_intro:      str                = ""
+    war_room_items:      list[WarRoomItem]  = Field(default_factory=list)
 
-    tasks = {
-        "front_page": (FRONT_PAGE_PROMPT, general_news),
-        "watercooler": (WATERCOOLER_PROMPT, reddit_sentiment),
-        "war_room": (WAR_ROOM_PROMPT, offseason_news),
-    }
+    @field_validator("sentiment_score", mode="before")
+    @classmethod
+    def clamp_score(cls, v: object) -> int:
+        """Coerce to int and clamp to [0, 100] rather than raising on bad LLM output."""
+        try:
+            return max(0, min(100, int(v)))
+        except (TypeError, ValueError):
+            return 50
 
-    results = {}
+    @model_validator(mode="after")
+    def truncate_lists(self) -> "LLMOutput":
+        self.sentiment_keywords = self.sentiment_keywords[:6]
+        self.war_room_items     = self.war_room_items[:4]
+        return self
 
-    logger.info("Launching 3 parallel LLM threads...")
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        future_to_key = {
-            executor.submit(_build_section, client, prompt, content): key
-            for key, (prompt, content) in tasks.items()
-        }
 
-        for future in as_completed(future_to_key):
-            key = future_to_key[future]
-            try:
-                results[key] = future.result()
-                logger.info(f"✓ Section '{key}' complete.")
-            except Exception as e:
-                logger.error(f"✗ Section '{key}' failed: {e}")
-                results[key] = f"*[Section unavailable due to an error: {e}]*"
+# ── ReportData — the shape passed to deliver.py ───────────────────────────────
+# Kept as a plain TypedDict (not Pydantic) because it is assembled by our own
+# code from already-validated sources, so there is nothing to validate.
 
-    # ── Stitch into final Markdown ────────────────────────────────────────
-    from datetime import datetime
-    date_str = datetime.now().strftime("%B %d, %Y")
+from typing import TypedDict
 
-    newsletter = f"""# 🐬 {team_name} Weekly Brief
-### {date_str}
+class WarRoomItemDict(TypedDict):
+    title:   str
+    summary: str
 
----
+class SentimentBreakdownDict(TypedDict):
+    positive: int
+    neutral:  int
+    negative: int
 
-## 📰 The Front Page
+class ReportData(TypedDict):
+    team_name:           str
+    date:                str
+    season_note:         str
+    executive_summary:   str
+    sentiment_score:     int
+    sentiment_label:     str
+    sentiment_trend:     str
+    sentiment_breakdown: SentimentBreakdownDict
+    sentiment_keywords:  list[str]
+    war_room_intro:      str
+    war_room_items:      list[WarRoomItemDict]
 
-{results.get('front_page', '*Unavailable*')}
 
----
+# ── Prompt ────────────────────────────────────────────────────────────────────
 
-## 🍺 The Watercooler
+ANALYSIS_PROMPT = """\
+You are an NFL analyst producing the data payload for a weekly {team} fan intelligence report.
 
-{results.get('watercooler', '*Unavailable*')}
+You will be given:
+  1. GENERAL NEWS   — recent headlines about the team
+  2. REDDIT DATA    — hot posts and top comments from the team subreddit
+  3. OFFSEASON NEWS — roster, draft, and front-office headlines
 
----
+Your job is to analyze this data and return a single JSON object with the following fields.
+Return ONLY the JSON object — no markdown fences, no explanation, no extra text.
 
-## 🏈 The War Room
+{{
+  "season_note": "<string: one short phrase describing the current NFL calendar moment, e.g. 'NFL Scouting Combine Week'. Base it on the news data.>",
 
-{results.get('war_room', '*Unavailable*')}
+  "executive_summary": "<string: 2–3 sentence paragraph. The single most important thing happening with this team right now, written in a direct journalistic tone. Base it only on the provided data. No hype.>",
 
----
+  "sentiment_score": <integer 0–100: your overall read of fan mood based on the Reddit data. 0=extremely negative, 50=neutral, 100=euphoric.>,
+  "sentiment_label": "<string: 2–3 word label matching the score, e.g. 'Highly Optimistic', 'Cautiously Pessimistic', 'Frustrated but Hopeful'>",
+  "sentiment_trend": "<string: brief trend note based on post tone, e.g. '+5 pts vs last week' — if you cannot determine a trend from the data, write 'Stable'>",
+  "sentiment_breakdown": {{
+    "positive": <integer: estimated % of posts/comments that are positive, must sum to 100 with neutral+negative>,
+    "neutral":  <integer>,
+    "negative": <integer>
+  }},
+  "sentiment_keywords": ["<keyword>", "<keyword>", "<keyword>", "<keyword>"],
 
-*Bleacher Bot — automated with ❤️ and Gemma 3 27B*
+  "war_room_intro": "<string: one sentence framing the team's main front-office priority this week, based only on the offseason news data.>",
+  "war_room_items": [
+    {{"title": "<short label>", "summary": "<one sentence drawn from the data>"}},
+    {{"title": "<short label>", "summary": "<one sentence drawn from the data>"}}
+  ]
+}}
+
+Rules:
+- Base every field ONLY on the data provided below. Do not invent players, transactions, or events.
+- war_room_items: include 2–4 items depending on how much the data supports. Do not pad.
+- sentiment_keywords: extract actual topics being discussed (player names, events, themes).
+- The JSON must be valid and parseable. Use double quotes for all strings.
+- Do not include any text before or after the JSON object.\
 """
 
-    return newsletter
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _fallback_report(team_name: str) -> ReportData:
+    """Returns a minimal valid ReportData when the LLM call or parse fails."""
+    return ReportData(
+        team_name          = team_name,
+        date               = datetime.now().strftime("%B %d, %Y"),
+        season_note        = "Weekly Report",
+        executive_summary  = "This week's summary could not be generated. Please check back next week.",
+        sentiment_score    = 50,
+        sentiment_label    = "Unavailable",
+        sentiment_trend    = "—",
+        sentiment_breakdown= SentimentBreakdownDict(positive=33, neutral=34, negative=33),
+        sentiment_keywords = [],
+        war_room_intro     = "Front-office data unavailable this week.",
+        war_room_items     = [],
+    )
+
+
+def _extract_json(raw: str) -> dict:
+    """
+    Extract and parse a JSON object from raw LLM output.
+    Handles the common case where the model wraps output in markdown fences
+    despite being told not to.
+    """
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw.strip())
+    start = raw.find("{")
+    end   = raw.rfind("}") + 1
+    if start == -1 or end == 0:
+        raise ValueError("No JSON object found in LLM output")
+    return json.loads(raw[start:end])
+
+
+# ── Main composer ─────────────────────────────────────────────────────────────
+
+def build_report(
+    general_news:   NewsData,
+    reddit_data:    RedditData,
+    offseason_news: NewsData,
+) -> ReportData:
+    """
+    Calls the LLM once with all three scraped data sources and returns a
+    fully populated ReportData dict ready for deliver.render_report().
+
+    The LLM response is validated with Pydantic (LLMOutput) before being
+    converted to a plain ReportData TypedDict for the rest of the pipeline.
+    """
+    client    = GeminiClient()
+    team_name = TEAM["name"]
+
+    user_content = (
+        f"--- GENERAL NEWS ---\n{general_news['text_blob']}\n\n"
+        f"--- REDDIT DATA ---\n{reddit_data['posts_text']}\n\n"
+        f"--- OFFSEASON / FRONT-OFFICE NEWS ---\n{offseason_news['text_blob']}\n"
+    )
+
+    prompt = ANALYSIS_PROMPT.format(team=team_name)
+
+    logger.info("Sending analysis prompt to LLM...")
+    try:
+        raw      = client.generate(system_prompt=prompt, user_content=user_content)
+        raw_dict = _extract_json(raw)
+        parsed   = LLMOutput.model_validate(raw_dict)
+        logger.info("✓ LLM response received and validated.")
+    except Exception as e:
+        logger.error(f"LLM call or validation failed: {e}")
+        return _fallback_report(team_name)
+
+    return ReportData(
+        team_name          = team_name,
+        date               = datetime.now().strftime("%B %d, %Y"),
+        season_note        = parsed.season_note,
+        executive_summary  = parsed.executive_summary,
+        sentiment_score    = parsed.sentiment_score,
+        sentiment_label    = parsed.sentiment_label,
+        sentiment_trend    = parsed.sentiment_trend,
+        sentiment_breakdown= SentimentBreakdownDict(
+            positive = parsed.sentiment_breakdown.positive,
+            neutral  = parsed.sentiment_breakdown.neutral,
+            negative = parsed.sentiment_breakdown.negative,
+        ),
+        sentiment_keywords = parsed.sentiment_keywords,
+        war_room_intro     = parsed.war_room_intro,
+        war_room_items     = [
+            WarRoomItemDict(title=item.title, summary=item.summary)
+            for item in parsed.war_room_items
+        ],
+    )
