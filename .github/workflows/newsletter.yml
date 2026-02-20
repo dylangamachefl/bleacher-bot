@@ -1,0 +1,45 @@
+name: NFL Newsletter
+
+on:
+  schedule:
+    # Every Monday at 12:00 UTC (8:00 AM ET)
+    - cron: '0 12 * * 1'
+  workflow_dispatch:  # Allow manual trigger from Actions tab
+
+jobs:
+  send-newsletter:
+    name: Build & Send Newsletter
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Bleacher Bot
+        env:
+          # ── LLM ────────────────────────────────────────────────────────
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+          # ── Reddit — no credentials needed (public JSON API) ───────────
+
+          # ── Email ──────────────────────────────────────────────────────
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.GMAIL_USER }}
+
+          # ── Team (override to switch teams) ───────────────────────────
+          TEAM_NAME: ${{ secrets.TEAM_NAME }}
+          TEAM_SUBREDDIT: ${{ secrets.TEAM_SUBREDDIT }}
+          TEAM_NEWS_QUERY: ${{ secrets.TEAM_NEWS_QUERY }}
+
+        run: python main.py
