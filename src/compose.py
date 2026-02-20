@@ -219,12 +219,25 @@ def build_report(
 
     logger.info("Sending analysis prompt to LLM...")
     try:
-        raw      = client.generate(system_prompt=prompt, user_content=user_content)
+        raw = client.generate(system_prompt=prompt, user_content=user_content)
+        logger.debug(f"Raw LLM response:\n{raw}")
+    except Exception as e:
+        logger.error(f"LLM call failed: {e}")
+        return _fallback_report(team_name)
+
+    try:
         raw_dict = _extract_json(raw)
-        parsed   = LLMOutput.model_validate(raw_dict)
+    except Exception as e:
+        logger.error(f"JSON extraction failed: {e}")
+        logger.error(f"Raw response was:\n{raw}")
+        return _fallback_report(team_name)
+
+    try:
+        parsed = LLMOutput.model_validate(raw_dict)
         logger.info("✓ LLM response received and validated.")
     except Exception as e:
-        logger.error(f"LLM call or validation failed: {e}")
+        logger.error(f"Pydantic validation failed: {e}")
+        logger.error(f"Parsed dict was: {raw_dict}")
         return _fallback_report(team_name)
 
     return ReportData(

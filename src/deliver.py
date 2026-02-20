@@ -84,27 +84,26 @@ def _render_executive_summary(report: ReportData) -> str:
     </section>"""
 
 
-def _render_sentiment(report: ReportData) -> str:
+def _render_sentiment(report: ReportData, reddit_data: RedditData) -> str:
     score     = report['sentiment_score']
     label     = report['sentiment_label']
     trend     = report['sentiment_trend']
     breakdown = report['sentiment_breakdown']
     keywords  = report['sentiment_keywords']
+    comments  = reddit_data['top_comments']
     sc        = sentiment_color(score)
 
     keyword_chips = "".join(
         f'<span style="background:#f1f5f9; color:#475569; font-size:0.75rem; padding:4px 10px; border-radius:6px; border:1px solid #e2e8f0;">#{e(kw)}</span>'
         for kw in keywords
-    )
+    ) or '<span style="font-size:0.8rem; color:#94a3b8;">No keywords extracted</span>'
 
-    # SVG circular progress
-    circumference = 100  # matches stroke-dasharray coordinate system
-    svg_progress  = f"""
+    svg_progress = f"""
       <svg width="120" height="120" viewBox="0 0 36 36" style="transform:rotate(-90deg);">
         <path stroke="#f1f5f9" stroke-width="3" fill="none"
           d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
         <path stroke="{sc}" stroke-width="3" fill="none"
-          stroke-dasharray="{score},{circumference}"
+          stroke-dasharray="{score},100"
           stroke-linecap="round"
           d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
       </svg>
@@ -113,9 +112,37 @@ def _render_sentiment(report: ReportData) -> str:
         <span style="font-size:0.65rem; color:#94a3b8;">/100</span>
       </div>"""
 
+    # ── Hot takes — rendered inside the same card ─────────────────────────
+    if comments:
+        comment_rows = ""
+        for c in comments:
+            comment_rows += f"""
+            <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px 14px; display:flex; gap:12px; align-items:flex-start;">
+              <div style="display:flex; flex-direction:column; align-items:center; flex-shrink:0; padding-top:2px;">
+                <span style="color:#f97316; font-size:1rem;">&#9650;</span>
+                <span style="font-size:0.7rem; font-weight:700; color:#64748b; margin-top:2px;">{e(str(c['upvotes']))}</span>
+              </div>
+              <div style="min-width:0;">
+                <p style="margin:0 0 3px; font-size:0.72rem; color:#94a3b8; font-weight:600;">{e(c['user'])}</p>
+                <p style="margin:0; font-size:0.85rem; color:#334155; line-height:1.55;">{e(c['text'])}</p>
+                <p style="margin:4px 0 0; font-size:0.7rem; color:#cbd5e1; font-style:italic;">{e(c['post'])}</p>
+              </div>
+            </div>"""
+
+        hot_takes_html = f"""
+        <div style="padding-top:20px; border-top:1px solid #f1f5f9; margin-top:4px;">
+          <p style="margin:0 0 12px; font-size:0.7rem; font-weight:700; text-transform:uppercase; letter-spacing:0.1em; color:#94a3b8;">
+            &#128293; Top Community Takes
+          </p>
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            {comment_rows}
+          </div>
+        </div>"""
+    else:
+        hot_takes_html = ""
+
     return f"""
     <section style="background:#fff; border-radius:12px; border:1px solid #e2e8f0; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.06);">
-      <!-- Section header bar -->
       <div style="background:#1e293b; padding:14px 20px; display:flex; justify-content:space-between; align-items:center;">
         <h2 style="margin:0; font-size:0.95rem; font-weight:700; color:#fff; display:flex; align-items:center; gap:8px;">
           &#128172; r/{e(TEAM['subreddit'])} Sentiment Radar
@@ -128,7 +155,6 @@ def _render_sentiment(report: ReportData) -> str:
       <div style="padding:20px 24px;">
         <!-- Score + breakdown row -->
         <div style="display:flex; gap:32px; align-items:center; padding-bottom:20px; border-bottom:1px solid #f1f5f9; margin-bottom:20px; flex-wrap:wrap;">
-          <!-- Circular score -->
           <div style="display:flex; flex-direction:column; align-items:center; gap:8px; flex-shrink:0;">
             <div style="position:relative; width:120px; height:120px;">
               {svg_progress}
@@ -138,7 +164,6 @@ def _render_sentiment(report: ReportData) -> str:
             </p>
           </div>
 
-          <!-- Breakdown bars + keywords -->
           <div style="flex:1; min-width:200px;">
             <div style="margin-bottom:16px;">
               <div style="display:flex; justify-content:space-between; font-size:0.72rem; color:#94a3b8; font-weight:600; margin-bottom:5px;">
@@ -160,37 +185,8 @@ def _render_sentiment(report: ReportData) -> str:
             </div>
           </div>
         </div>
-      </div>
-    </section>"""
 
-
-def _render_hot_takes(reddit_data: RedditData) -> str:
-    comments = reddit_data['top_comments']
-    if not comments:
-        return ""
-
-    rows = ""
-    for c in comments:
-        rows += f"""
-        <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px 14px; display:flex; gap:12px; align-items:flex-start;">
-          <div style="display:flex; flex-direction:column; align-items:center; flex-shrink:0; padding-top:2px;">
-            <span style="color:#f97316; font-size:1rem;">&#9650;</span>
-            <span style="font-size:0.7rem; font-weight:700; color:#64748b; margin-top:2px;">{e(str(c['upvotes']))}</span>
-          </div>
-          <div style="min-width:0;">
-            <p style="margin:0 0 3px; font-size:0.72rem; color:#94a3b8; font-weight:600;">{e(c['user'])}</p>
-            <p style="margin:0; font-size:0.85rem; color:#334155; line-height:1.55;">{e(c['text'])}</p>
-            <p style="margin:4px 0 0; font-size:0.7rem; color:#cbd5e1; font-style:italic;">{e(c['post'])}</p>
-          </div>
-        </div>"""
-
-    return f"""
-    <section style="background:#fff; border-radius:12px; border:1px solid #e2e8f0; padding:24px; box-shadow:0 1px 3px rgba(0,0,0,0.06);">
-      <h2 style="margin:0 0 14px; font-size:1rem; font-weight:700; padding-bottom:12px; border-bottom:1px solid #f1f5f9; color:#0f172a; display:flex; align-items:center; gap:8px;">
-        &#128293; Top Community Takes
-      </h2>
-      <div style="display:flex; flex-direction:column; gap:10px;">
-        {rows}
+        {hot_takes_html}
       </div>
     </section>"""
 
@@ -288,12 +284,11 @@ def render_report(
     """
     primary_color = "#005F66"   # Dolphins teal; swap per team if desired
 
-    header           = _render_header(report, primary_color)
-    exec_summary     = _render_executive_summary(report)
-    sentiment        = _render_sentiment(report)
-    hot_takes        = _render_hot_takes(reddit_data)
-    news_feed        = _render_news_feed(general_news, primary_color)
-    war_room         = _render_war_room(report, offseason_news, primary_color)
+    header       = _render_header(report, primary_color)
+    exec_summary = _render_executive_summary(report)
+    sentiment    = _render_sentiment(report, reddit_data)   # hot takes rendered inside
+    news_feed    = _render_news_feed(general_news, primary_color)
+    war_room     = _render_war_room(report, offseason_news, primary_color)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -338,7 +333,6 @@ def render_report(
     <div class="main-col">
       {exec_summary}
       {sentiment}
-      {hot_takes}
       {news_feed}
     </div>
 
