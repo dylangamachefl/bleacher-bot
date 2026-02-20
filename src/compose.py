@@ -276,10 +276,45 @@ def build_report(
 def _summarize_post(post: RedditPost, client: GeminiClient, team_name: str, subreddit: str) -> CommunityTakeDict:
     """
     Single focused LLM call to summarize one Reddit post.
-    Includes top comment text when available (local runs); falls back to
-    title + selftext only when comments couldn't be fetched (CI).
+
+    Two modes based on post type:
+      - Text posts:  2-3 sentences using selftext + top comments
+      - Media posts: 1 sentence strictly from the title — no invented content.
+        Media posts (images, videos, tweet screenshots) are kept in the report
+        because titles often carry real news value (e.g. "[Zenitz] Dolphins
+        hiring..."), but we constrain Gemma tightly so it cannot hallucinate
+        details it cannot actually see.
+
     Called in parallel by build_community_takes().
     """
+    is_media = post.get("is_media", False)
+
+    if is_media:
+        # Constrained prompt: title only, one sentence, no invention
+        summary = post["title"]   # safe fallback
+        try:
+            raw = client.generate(
+                system_prompt=(
+                    f"You are an NFL analyst writing one-line post labels "
+                    f"for the {team_name} weekly fan intelligence report."
+                ),
+                user_content=(
+                    f"This is an image or video post — you cannot see the media. "
+                    f"Write exactly ONE sentence summarizing what this post is about "
+                    f"based ONLY on the title below. Do not add any details, context, "
+                    f"or speculation beyond what the title explicitly states. "
+                    f"Return ONLY the sentence — no labels, no formatting.\n\n"
+                    f"Title: {post['title']}"
+                ),
+            )
+            summary = raw.strip().split("\n")[0]   # first line only
+            if len(summary) > 200:
+                summary = summary[:197] + "..."
+        except Exception as exc:
+            logger.warning(f"Media post summary failed for '{post['title']}': {exc}")
+        return CommunityTakeDict(title=post["title"], summary=summary)
+
+    # ── Text / link post — full context prompt ─────────────────────────────
     selftext_part = f"\nPost content:\n{post['selftext']}" if post['selftext'] else "\n(Link post — no body text.)"
 
     comments = post.get("comments", [])
@@ -332,6 +367,13 @@ def build_community_takes(posts: list[RedditPost]) -> list[CommunityTakeDict]:
 
     if not posts:
         return []
+
+    media_count = sum(1 for p in posts if p.get("is_media", False))
+    text_count  = len(posts) - media_count
+    logger.info(
+        f"Community takes: {len(posts)} posts — "
+        f"{text_count} text (full prompt), {media_count} media (title-only prompt)"
+    )
 
     client    = GeminiClient()
     team_name = TEAM["name"]

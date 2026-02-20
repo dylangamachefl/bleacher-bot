@@ -46,6 +46,7 @@ class RedditPost(TypedDict):
     age:      str
     selftext: str         # may be empty for link posts
     comments: list[str]   # top comment bodies; empty if fetch failed or blocked
+    is_media: bool        # True for image/video/meme posts — skip LLM summarization
 
 
 class RedditData(TypedDict):
@@ -123,20 +124,49 @@ _REDDIT_HEADERS = {
 }
 
 
-def _fetch_post_comments(post_url: str, limit: int = REDDIT_COMMENT_LIMIT) -> list[str]:
+_MEDIA_DOMAINS = (
+    "i.redd.it", "v.redd.it", "preview.redd.it",
+    "i.imgur.com", "imgur.com/", "gfycat.com", "redgifs.com", "giphy.com",
+)
+_MEDIA_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".mp4", ".webm", ".gifv", ".mov")
+
+_JSON_MEDIA_HINTS = {"image", "video", "rich:video", "hosted:video"}
+
+
+def _is_media_rss(raw_summary: str, entry) -> bool:
+    """
+    Detect image/video/meme posts using only data available from the RSS feed.
+    Checks the raw HTML summary and any links attached to the entry for known
+    media domains and file extensions. Works in CI — no extra API calls needed.
+    """
+    lower = raw_summary.lower()
+    if any(domain in lower for domain in _MEDIA_DOMAINS):
+        return True
+    for link in entry.get("links", []):
+        href = link.get("href", "").lower()
+        if any(domain in href for domain in _MEDIA_DOMAINS):
+            return True
+        if any(href.endswith(ext) for ext in _MEDIA_EXTENSIONS):
+            return True
+    return False
+
+
+def _fetch_post_comments(post_url: str, limit: int = REDDIT_COMMENT_LIMIT) -> tuple[list[str], bool | None]:
     """
     Fetch the top comments for one Reddit post via the public JSON API.
     Extracts the post ID from the RSS entry URL and hits:
       https://www.reddit.com/comments/<id>.json?sort=top
 
-    Returns a list of comment body strings (up to `limit`).
-    Returns [] silently on any error — this is expected on GitHub Actions
-    where Reddit's API is blocked from cloud IP ranges.
+    Returns (comments, is_media_from_json):
+      - comments:           list of top comment body strings (up to `limit`)
+      - is_media_from_json: True/False from post_hint; None if fetch failed
+    Returns ([], None) silently on any error — expected on GitHub Actions
+    where Reddit's JSON API is blocked from cloud IP ranges.
     """
     import re
     match = re.search(r"/comments/([a-z0-9]+)/", post_url)
     if not match:
-        return []
+        return [], None
     post_id  = match.group(1)
     json_url = f"https://www.reddit.com/comments/{post_id}.json?sort=top&limit={limit * 3}"
 
@@ -145,7 +175,12 @@ def _fetch_post_comments(post_url: str, limit: int = REDDIT_COMMENT_LIMIT) -> li
         resp.raise_for_status()
         data = resp.json()   # [post_listing, comment_listing]
         if len(data) < 2:
-            return []
+            return [], None
+
+        # Extract post_hint from the post listing for reliable media detection
+        post_data      = data[0]["data"]["children"][0]["data"] if data[0]["data"]["children"] else {}
+        post_hint      = post_data.get("post_hint", "")
+        is_media       = post_hint in _JSON_MEDIA_HINTS
 
         comments: list[str] = []
         for child in data[1]["data"]["children"]:
@@ -159,10 +194,10 @@ def _fetch_post_comments(post_url: str, limit: int = REDDIT_COMMENT_LIMIT) -> li
             comments.append(body[:300])
             if len(comments) >= limit:
                 break
-        return comments
+        return comments, is_media
     except Exception as exc:
         logger.debug(f"Comment fetch skipped for {post_url}: {exc}")
-        return []
+        return [], None
 
 
 # ── Public scrapers ───────────────────────────────────────────────────────────
@@ -280,7 +315,7 @@ def fetch_reddit_data() -> RedditData:
         text_lines.append(f"  Author: {author}")
         text_lines.append("")
 
-        # Structured post for per-card rendering (comments filled in below)
+        # Structured post for per-card rendering (comments + is_media refined below)
         posts.append(RedditPost(
             title=title,
             author=author,
@@ -288,6 +323,7 @@ def fetch_reddit_data() -> RedditData:
             age=age,
             selftext=snippet,
             comments=[],
+            is_media=_is_media_rss(raw_summary, entry),
         ))
 
         # Keep legacy RedditComment list as fallback
@@ -314,12 +350,20 @@ def fetch_reddit_data() -> RedditData:
             for i in range(len(posts))
             if posts[i]["url"]
         }
-        fetched, skipped = 0, 0
+        fetched, skipped, media_filtered = 0, 0, 0
         for future in as_completed(future_to_idx):
-            idx      = future_to_idx[future]
-            comments = future.result()   # always returns a list, never raises
+            idx                  = future_to_idx[future]
+            comments, is_media_json = future.result()   # never raises
+
             posts[idx]["comments"] = comments
-            if comments:
+
+            # JSON post_hint is authoritative — override the RSS-based guess when available
+            if is_media_json is not None:
+                posts[idx]["is_media"] = is_media_json
+
+            if posts[idx]["is_media"]:
+                media_filtered += 1
+            elif comments:
                 fetched += 1
                 # Append comment text to the flat LLM context blob too
                 text_lines.append(f"  Top comments for: {posts[idx]['title']}")
@@ -330,8 +374,9 @@ def fetch_reddit_data() -> RedditData:
                 skipped += 1
 
     logger.info(
-        f"Reddit RSS: {len(entries)} posts fetched — "
-        f"comments: {fetched} posts had data, {skipped} skipped (blocked or link-only)"
+        f"Reddit RSS: {len(entries)} posts — "
+        f"comments fetched: {fetched}, skipped (blocked/link-only): {skipped}, "
+        f"media posts filtered: {media_filtered}"
     )
 
     return RedditData(posts_text="\n".join(text_lines), top_comments=top_posts, posts=posts)
