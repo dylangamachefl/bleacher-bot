@@ -5,6 +5,7 @@ scrape.py — Public data scrapers: Google News RSS and Reddit JSON API.
 import feedparser
 import requests
 import logging
+from datetime import datetime, timezone
 
 from src.config import (
     TEAM,
@@ -46,12 +47,17 @@ def fetch_general_news() -> str:
 
 def fetch_reddit_sentiment() -> str:
     """
-    Scrapes the top weekly posts and top comments from the team subreddit
-    using Reddit's public JSON API — no credentials required.
+    Scrapes hot posts and top comments from the team subreddit using
+    Reddit's public JSON API — no credentials required.
+
+    Uses /hot instead of /top?t=week so results reflect current fanbase
+    activity rather than high-score posts that may be days old. Each post
+    includes a human-readable timestamp so the LLM knows how fresh it is.
+
     Returns a plain-text blob suitable for LLM input.
     """
     subreddit_name = TEAM["subreddit"]
-    url = f"https://www.reddit.com/r/{subreddit_name}/top.json?t=week&limit={REDDIT_POST_LIMIT}"
+    url = f"https://www.reddit.com/r/{subreddit_name}/hot.json?limit={REDDIT_POST_LIMIT}"
     headers = {"User-Agent": "BleacherBot/1.0 (newsletter automation; read-only)"}
     logger.info(f"Fetching Reddit sentiment from r/{subreddit_name} (public JSON API)")
 
@@ -65,18 +71,35 @@ def fetch_reddit_sentiment() -> str:
 
     posts = data.get("data", {}).get("children", [])
 
+    # /hot always has a sticky "welcome" post pinned at the top — skip it
+    posts = [p for p in posts if not p.get("data", {}).get("stickied", False)]
+
     if not posts:
         logger.warning(f"No Reddit posts found in r/{subreddit_name}")
         return "No Reddit activity found for this team this week."
 
+    now = datetime.now(timezone.utc)
     lines = []
-    for post_wrapper in posts:
+    for post_wrapper in posts[:REDDIT_POST_LIMIT]:
         post = post_wrapper.get("data", {})
         title = post.get("title", "").strip()
         score = post.get("score", 0)
         selftext = post.get("selftext", "").strip()
 
-        lines.append(f"### Post: {title} (↑{score})")
+        # Compute a human-readable age so the LLM knows how current this is
+        created_utc = post.get("created_utc", 0)
+        if created_utc:
+            age_hours = (now - datetime.fromtimestamp(created_utc, tz=timezone.utc)).total_seconds() / 3600
+            if age_hours < 1:
+                age_label = "< 1 hour ago"
+            elif age_hours < 24:
+                age_label = f"{int(age_hours)}h ago"
+            else:
+                age_label = f"{int(age_hours / 24)}d ago"
+        else:
+            age_label = "unknown age"
+
+        lines.append(f"### Post: {title} (↑{score}, posted {age_label})")
         if selftext and len(selftext) > 20:
             lines.append(f"Body: {selftext[:400]}")
 
@@ -92,7 +115,7 @@ def fetch_reddit_sentiment() -> str:
                 for comment in comments[:REDDIT_COMMENT_LIMIT]:
                     body = comment.get("data", {}).get("body", "").strip().replace("\n", " ")
                     c_score = comment.get("data", {}).get("score", 0)
-                    if body and body != "[deleted]":
+                    if body and body not in ("[deleted]", "[removed]"):
                         lines.append(f"  └ Comment (↑{c_score}): {body[:300]}")
             except Exception as e:
                 logger.warning(f"Could not fetch comments for post {post_id}: {e}")
