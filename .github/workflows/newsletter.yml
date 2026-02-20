@@ -30,7 +30,7 @@ jobs:
           # ── LLM ────────────────────────────────────────────────────────
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
-          # ── Reddit — no credentials needed (public JSON API) ───────────
+          # ── Reddit — public RSS feed, no credentials needed ────────────
 
           # ── Email ──────────────────────────────────────────────────────
           GMAIL_USER: ${{ secrets.GMAIL_USER }}

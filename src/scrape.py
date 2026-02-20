@@ -142,90 +142,102 @@ def fetch_general_news() -> NewsData:
     return NewsData(items=items, text_blob="\n".join(text_lines))
 
 
+def _strip_html(text: str) -> str:
+    """Remove HTML tags and decode common HTML entities from a string."""
+    import re
+    import html as html_module
+    # Remove all HTML tags
+    clean = re.sub(r"<[^>]+>", "", text)
+    # Decode HTML entities (&#32; &amp; &quot; etc.)
+    clean = html_module.unescape(clean)
+    return clean.strip()
+
+
 def fetch_reddit_data() -> RedditData:
     """
-    Scrapes hot posts and top comments from the team subreddit.
+    Scrapes hot posts from the team subreddit via the public RSS feed.
+
+    Reddit's RSS feed (https://www.reddit.com/r/<sub>/hot.rss) requires no
+    credentials and works from CI environments, unlike the JSON API which is
+    blocked on cloud IP ranges.
+
+    The RSS entries contain post titles, authors, selftext snippets (in the
+    summary field), publication timestamps, and links. We surface the most
+    discussion-worthy posts as "Top Community Takes" in the report.
 
     Returns a RedditData dict containing:
-      - posts_text:   flat text blob (post titles + top comments) for LLM context
-      - top_comments: list of the highest-upvoted RedditComment dicts across all
-                      fetched posts, for direct rendering as hot takes in the report
+      - posts_text:   flat text blob for LLM context
+      - top_comments: list of RedditComment-shaped dicts (one per notable post)
+                      for direct rendering in the sentiment card
     """
     subreddit = TEAM["subreddit"]
-    url = f"https://www.reddit.com/r/{subreddit}/hot.json?limit={REDDIT_POST_LIMIT}"
-    headers = {"User-Agent": "BleacherBot/1.0 (newsletter automation; read-only)"}
-    logger.info(f"Fetching Reddit data from r/{subreddit}")
+    url = f"https://www.reddit.com/r/{subreddit}/hot.rss?limit={REDDIT_POST_LIMIT}"
+    logger.info(f"Fetching Reddit RSS from r/{subreddit}")
 
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        feed = feedparser.parse(url)
     except Exception as e:
-        logger.error(f"Reddit fetch failed: {e}")
+        logger.error(f"Reddit RSS parse failed: {e}")
         return RedditData(posts_text="Could not retrieve Reddit data this week.", top_comments=[])
 
-    posts = data.get("data", {}).get("children", [])
-    posts = [p for p in posts if not p.get("data", {}).get("stickied", False)]
+    # Filter out AutoModerator/bot posts and take up to the limit
+    entries = [
+        e for e in feed.entries
+        if e.get("author", "").lower() not in ("/u/automoderator", "automoderator")
+    ][:REDDIT_POST_LIMIT]
 
-    if not posts:
-        logger.warning(f"No Reddit posts found in r/{subreddit}")
+    if not entries:
+        logger.warning(f"No Reddit RSS entries found for r/{subreddit}")
         return RedditData(posts_text="No Reddit activity found this week.", top_comments=[])
 
-    all_comments: list[RedditComment] = []
-    text_lines:   list[str]           = []
+    text_lines: list[str]         = []
+    top_posts:  list[RedditComment] = []
 
-    for post_wrapper in posts[:REDDIT_POST_LIMIT]:
-        post  = post_wrapper.get("data", {})
-        title = post.get("title", "").strip()
-        score = post.get("score", 0)
-        age   = _age_label(post.get("created_utc", 0))
+    for entry in entries:
+        title  = entry.get("title", "").strip()
+        author = entry.get("author", "u/unknown").strip()
+        link   = entry.get("link", "")
+        age    = _parse_rss_date(entry)
 
-        text_lines.append(f"### {title} (↑{score}, {age})")
+        # The RSS summary is an HTML blob — extract readable text from it
+        raw_summary = entry.get("summary", "")
+        summary     = _strip_html(raw_summary)
+        # Strip Reddit navigation artifacts present in all summaries
+        for artifact in ("[link]", "[comments]", "submitted by", "[removed]", "[deleted]"):
+            summary = summary.replace(artifact, "")
+        # Collapse whitespace
+        summary = " ".join(summary.split())
+        # Link posts (no selftext) leave only the author handle after stripping.
+        # Detect these: if the only word that isn't a /u/ mention is gone, discard.
+        words_without_usernames = [
+            w for w in summary.split() if not w.startswith("/u/") and not w.startswith("u/")
+        ]
+        snippet = summary[:300] if len(words_without_usernames) > 3 else ""
 
-        selftext = post.get("selftext", "").strip()
-        if selftext and len(selftext) > 20:
-            text_lines.append(f"Body: {selftext[:300]}")
-
-        post_id = post.get("id", "")
-        author  = post.get("author", "u/unknown")
-
-        if post_id:
-            comments_url = (
-                f"https://www.reddit.com/r/{subreddit}/comments/{post_id}.json"
-                f"?limit={REDDIT_COMMENT_LIMIT}&sort=top"
-            )
-            try:
-                c_resp = requests.get(comments_url, headers=headers, timeout=10)
-                c_resp.raise_for_status()
-                c_data = c_resp.json()
-                comments = c_data[1].get("data", {}).get("children", [])
-
-                for comment in comments[:REDDIT_COMMENT_LIMIT]:
-                    cdata   = comment.get("data", {})
-                    body    = cdata.get("body", "").strip().replace("\n", " ")
-                    c_score = cdata.get("score", 0)
-                    c_user  = cdata.get("author", "u/unknown")
-
-                    if not body or body in ("[deleted]", "[removed]"):
-                        continue
-
-                    text_lines.append(f"  └ u/{c_user} (↑{c_score}): {body[:300]}")
-                    all_comments.append(RedditComment(
-                        user=f"u/{c_user}",
-                        text=body[:280],
-                        upvotes=c_score,
-                        post=title,
-                    ))
-
-            except Exception as e:
-                logger.warning(f"Could not fetch comments for post {post_id}: {e}")
-
+        text_lines.append(f"### {title} ({age})")
+        if snippet:
+            text_lines.append(f"  {snippet}")
+        text_lines.append(f"  Author: {author}")
         text_lines.append("")
 
-    # Sort all collected comments by upvotes, keep the top N for the hot-takes UI
-    top_comments = sorted(all_comments, key=lambda c: c["upvotes"], reverse=True)[:TOP_COMMENTS_TARGET]
+        # Surface posts that have substantive self-text as "community takes"
+        # Posts without selftext (link posts) use the title as the take text
+        take_text = snippet if snippet else title
+        top_posts.append(RedditComment(
+            user=author,
+            text=take_text[:280],
+            upvotes=0,          # RSS doesn't expose upvote counts
+            post=title,
+        ))
 
-    return RedditData(posts_text="\n".join(text_lines), top_comments=top_comments)
+    # Prefer posts with selftext (more discussion-worthy) for the hot takes UI
+    # Posts with a snippet come first; trim to target count
+    top_posts.sort(key=lambda p: len(p["text"]), reverse=True)
+    top_posts = top_posts[:TOP_COMMENTS_TARGET]
+
+    logger.info(f"Reddit RSS: {len(entries)} posts fetched, {len(top_posts)} selected for hot takes")
+
+    return RedditData(posts_text="\n".join(text_lines), top_comments=top_posts)
 
 
 def fetch_offseason_news() -> NewsData:

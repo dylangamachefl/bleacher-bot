@@ -1,11 +1,12 @@
 """
-llm.py — Google AI Studio client wrapper using google.generativeai.
+llm.py — Google AI Studio client wrapper using google.genai.
          Defaults to gemma-3-27b-it.
 """
 
 import time
 import logging
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from src.config import GEMINI_API_KEY
 
@@ -17,7 +18,7 @@ RETRY_DELAY_SECONDS = 5
 
 
 class GeminiClient:
-    """Thin wrapper around the google.generativeai SDK for Gemma 3 27B IT."""
+    """Thin wrapper around the google.genai SDK for Gemma 3 27B IT."""
 
     def __init__(self):
         if not GEMINI_API_KEY:
@@ -25,8 +26,7 @@ class GeminiClient:
                 "GEMINI_API_KEY is not set. "
                 "Add it to your .env file or GitHub Secrets."
             )
-        genai.configure(api_key=GEMINI_API_KEY)
-        self.model = genai.GenerativeModel(model_name=MODEL_NAME)
+        self.client = genai.Client(api_key=GEMINI_API_KEY)
         logger.info(f"GeminiClient initialized with model: {MODEL_NAME}")
 
     def generate(self, system_prompt: str, user_content: str) -> str:
@@ -39,7 +39,7 @@ class GeminiClient:
             user_content:  The raw scraped data for the model to synthesize.
 
         Returns:
-            Generated newsletter section as a string.
+            Generated text as a string.
         """
         # Gemma via Google AI Studio doesn't support a separate system role,
         # so we prepend the system prompt into the user turn.
@@ -48,7 +48,13 @@ class GeminiClient:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 logger.info(f"LLM call attempt {attempt}/{MAX_RETRIES}")
-                response = self.model.generate_content(full_prompt)
+                response = self.client.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=full_prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.4,
+                    ),
+                )
                 return response.text.strip()
             except Exception as e:
                 logger.warning(f"LLM attempt {attempt} failed: {e}")

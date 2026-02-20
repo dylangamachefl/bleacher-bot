@@ -132,8 +132,8 @@ Return ONLY the JSON object — no markdown fences, no explanation, no extra tex
 
   "executive_summary": "<string: 2–3 sentence paragraph. The single most important thing happening with this team right now, written in a direct journalistic tone. Base it only on the provided data. No hype.>",
 
-  "sentiment_score": <integer 0–100: your overall read of fan mood based on the Reddit data. 0=extremely negative, 50=neutral, 100=euphoric.>,
-  "sentiment_label": "<string: 2–3 word label matching the score, e.g. 'Highly Optimistic', 'Cautiously Pessimistic', 'Frustrated but Hopeful'>",
+  "sentiment_score": <integer 0–100: your overall read of fan mood based on the Reddit data. Use this scale — 0-20: extremely negative/angry, 21-35: frustrated/pessimistic, 36-49: cautious/mixed-negative, 50: perfectly neutral, 51-64: cautious/mixed-positive, 65-79: optimistic/excited, 80-100: euphoric. Most weeks will NOT be 50 — pick the number that best reflects the dominant tone in the posts and comments.>,
+  "sentiment_label": "<string: 2–3 word label matching the score, e.g. 'Highly Optimistic', 'Cautiously Pessimistic', 'Frustrated but Hopeful', 'Cautious but Interested'>",
   "sentiment_trend": "<string: brief trend note based on post tone, e.g. '+5 pts vs last week' — if you cannot determine a trend from the data, write 'Stable'>",
   "sentiment_breakdown": {{
     "positive": <integer: estimated % of posts/comments that are positive, must sum to 100 with neutral+negative>,
@@ -239,6 +239,8 @@ def build_report(
         logger.error(f"Pydantic validation failed: {e}")
         logger.error(f"Parsed dict was: {raw_dict}")
         return _fallback_report(team_name)
+
+    logger.info(f"LLM sentiment: score={parsed.sentiment_score}, label='{parsed.sentiment_label}', keywords={parsed.sentiment_keywords}")
 
     return ReportData(
         team_name          = team_name,

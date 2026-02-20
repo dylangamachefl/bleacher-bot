@@ -1,5 +1,5 @@
 feedparser
 requests
-google-generativeai
+google-genai
 python-dotenv
 pydantic>=2.0

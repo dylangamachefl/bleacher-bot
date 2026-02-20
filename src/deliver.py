@@ -116,12 +116,20 @@ def _render_sentiment(report: ReportData, reddit_data: RedditData) -> str:
     if comments:
         comment_rows = ""
         for c in comments:
+            # Upvote badge: only show when we have a real score (RSS gives 0)
+            upvote_badge = (
+                f'<div style="display:flex; flex-direction:column; align-items:center; flex-shrink:0; padding-top:2px;">'
+                f'<span style="color:#f97316; font-size:1rem;">&#9650;</span>'
+                f'<span style="font-size:0.7rem; font-weight:700; color:#64748b; margin-top:2px;">{e(str(c["upvotes"]))}</span>'
+                f'</div>'
+            ) if c["upvotes"] > 0 else (
+                f'<div style="flex-shrink:0; width:24px; display:flex; align-items:flex-start; padding-top:4px;">'
+                f'<span style="color:#cbd5e1; font-size:0.85rem;">&#9656;</span>'
+                f'</div>'
+            )
             comment_rows += f"""
             <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px 14px; display:flex; gap:12px; align-items:flex-start;">
-              <div style="display:flex; flex-direction:column; align-items:center; flex-shrink:0; padding-top:2px;">
-                <span style="color:#f97316; font-size:1rem;">&#9650;</span>
-                <span style="font-size:0.7rem; font-weight:700; color:#64748b; margin-top:2px;">{e(str(c['upvotes']))}</span>
-              </div>
+              {upvote_badge}
               <div style="min-width:0;">
                 <p style="margin:0 0 3px; font-size:0.72rem; color:#94a3b8; font-weight:600;">{e(c['user'])}</p>
                 <p style="margin:0; font-size:0.85rem; color:#334155; line-height:1.55;">{e(c['text'])}</p>

@@ -20,7 +20,8 @@ TEAM = {
 # ── API Keys ────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# Reddit — no credentials needed; uses public JSON API
+# Reddit — public RSS feed, no credentials required
+# (JSON API is blocked on cloud IPs; RSS works everywhere)
 
 GMAIL_USER = os.getenv("GMAIL_USER", "")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
