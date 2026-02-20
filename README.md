@@ -44,11 +44,6 @@ To activate the venv in future sessions:
 # LLM — Google AI Studio
 GEMINI_API_KEY=your_key_here
 
-# Reddit (read-only script app)
-REDDIT_CLIENT_ID=your_client_id
-REDDIT_CLIENT_SECRET=your_client_secret
-REDDIT_USER_AGENT=BleacherBot/1.0
-
 # Gmail (use an App Password, not your real password)
 GMAIL_USER=you@gmail.com
 GMAIL_APP_PASSWORD=xxxx_xxxx_xxxx_xxxx
@@ -106,8 +101,8 @@ TEAM_NEWS_QUERY=Philadelphia+Eagles+NFL
 ## Getting Credentials
 
 - **Google AI Studio API Key:** https://aistudio.google.com/apikey
-- **Reddit App:** https://www.reddit.com/prefs/apps → Create "script" app
 - **Gmail App Password:** https://myaccount.google.com/apppasswords (requires 2FA)
+- **Reddit:** no credentials needed — uses the public JSON API (`reddit.com/r/{subreddit}/top.json`)
 
 ---
 
