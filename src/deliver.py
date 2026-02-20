@@ -18,7 +18,7 @@ from email import encoders
 
 from src.config import GMAIL_USER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL, DRY_RUN, TEAM
 from src.compose import ReportData
-from src.scrape import NewsData, RedditData
+from src.scrape import NewsData, RedditData, RedditPost
 
 logger = logging.getLogger(__name__)
 
@@ -112,11 +112,54 @@ def _render_sentiment(report: ReportData, reddit_data: RedditData) -> str:
         <span style="font-size:0.65rem; color:#94a3b8;">/100</span>
       </div>"""
 
-    # ── Hot takes — rendered inside the same card ─────────────────────────
-    if comments:
+    # ── Community Takes — one card per Reddit post, with Gemma summary ────
+    community_takes = report.get("community_takes", [])
+    posts           = reddit_data.get("posts", [])
+
+    # Build a lookup so we can match LLM summaries back to scraped post metadata
+    post_lookup: dict[str, RedditPost] = {p["title"]: p for p in posts}
+
+    if community_takes:
+        take_cards = ""
+        for take in community_takes:
+            post   = post_lookup.get(take["title"], {})
+            author = post.get("author", "")
+            url    = post.get("url", "")
+            age    = post.get("age", "")
+
+            author_html = f'<span style="font-size:0.72rem; font-weight:600; color:#94a3b8;">{e(author)}</span>' if author else ""
+            age_html    = f'<span style="font-size:0.68rem; color:#cbd5e1;">{e(age)}</span>' if age else ""
+            link_html   = (
+                f'<a href="{e(url)}" target="_blank" style="font-size:0.72rem; color:#64748b; text-decoration:none; font-weight:500; margin-top:6px; display:inline-block;">'
+                f'View on Reddit &#8599;</a>'
+            ) if url else ""
+
+            take_cards += f"""
+            <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px 14px;">
+              <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap;">
+                <span style="color:#cbd5e1; font-size:0.85rem;">&#9656;</span>
+                {author_html}
+                {age_html}
+              </div>
+              <p style="margin:0 0 5px; font-size:0.85rem; font-weight:600; color:#0f172a; line-height:1.4;">{e(take['title'])}</p>
+              <p style="margin:0; font-size:0.82rem; color:#475569; line-height:1.55;">{e(take['summary'])}</p>
+              {link_html}
+            </div>"""
+
+        hot_takes_html = f"""
+        <div style="padding-top:20px; border-top:1px solid #f1f5f9; margin-top:4px;">
+          <p style="margin:0 0 12px; font-size:0.7rem; font-weight:700; text-transform:uppercase; letter-spacing:0.1em; color:#94a3b8;">
+            &#128293; Top Community Takes
+          </p>
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            {take_cards}
+          </div>
+        </div>"""
+
+    elif comments:
+        # Fallback: show legacy comment cards if LLM didn't return community_takes
         comment_rows = ""
         for c in comments:
-            # Upvote badge: only show when we have a real score (RSS gives 0)
             upvote_badge = (
                 f'<div style="display:flex; flex-direction:column; align-items:center; flex-shrink:0; padding-top:2px;">'
                 f'<span style="color:#f97316; font-size:1rem;">&#9650;</span>'

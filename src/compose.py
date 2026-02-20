@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.llm import GeminiClient
 from src.config import TEAM
-from src.scrape import NewsData, RedditData
+from src.scrape import NewsData, RedditData, RedditPost
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +95,10 @@ class WarRoomItemDict(TypedDict):
     title:   str
     summary: str
 
+class CommunityTakeDict(TypedDict):
+    title:   str
+    summary: str
+
 class SentimentBreakdownDict(TypedDict):
     positive: int
     neutral:  int
@@ -112,6 +116,7 @@ class ReportData(TypedDict):
     sentiment_keywords:  list[str]
     war_room_intro:      str
     war_room_items:      list[WarRoomItemDict]
+    community_takes:     list[CommunityTakeDict]
 
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
@@ -174,6 +179,7 @@ def _fallback_report(team_name: str) -> ReportData:
         sentiment_keywords = [],
         war_room_intro     = "Front-office data unavailable this week.",
         war_room_items     = [],
+        community_takes    = [],
     )
 
 
@@ -261,4 +267,91 @@ def build_report(
             WarRoomItemDict(title=item.title, summary=item.summary)
             for item in parsed.war_room_items
         ],
+        community_takes    = [],   # populated separately by build_community_takes()
     )
+
+
+# ── Per-post community take summarizer ────────────────────────────────────────
+
+def _summarize_post(post: RedditPost, client: GeminiClient, team_name: str, subreddit: str) -> CommunityTakeDict:
+    """
+    Single focused LLM call to summarize one Reddit post.
+    Includes top comment text when available (local runs); falls back to
+    title + selftext only when comments couldn't be fetched (CI).
+    Called in parallel by build_community_takes().
+    """
+    selftext_part = f"\nPost content:\n{post['selftext']}" if post['selftext'] else "\n(Link post — no body text.)"
+
+    comments = post.get("comments", [])
+    if comments:
+        numbered = "\n".join(f"  {i+1}. {c}" for i, c in enumerate(comments))
+        comments_part = f"\n\nTop comments:\n{numbered}"
+    else:
+        comments_part = ""
+
+    has_comments = bool(comments)
+    instruction  = (
+        "Summarize this post in 2-3 sentences covering: what the post is about, "
+        "and what the top comments reveal about how fans feel. "
+        if has_comments else
+        "Summarize this post in 2-3 sentences: what it is about and why it matters to fans. "
+    )
+
+    summary = post["selftext"] or post["title"]   # safe fallback
+    try:
+        raw = client.generate(
+            system_prompt=(
+                f"You are an NFL analyst writing brief post summaries "
+                f"for the {team_name} weekly fan intelligence report."
+            ),
+            user_content=(
+                f"{instruction}"
+                f"Be direct and factual. Do not mention Reddit. "
+                f"Return ONLY the summary text — no labels, no formatting.\n\n"
+                f"Title: {post['title']}"
+                f"{selftext_part}"
+                f"{comments_part}"
+            ),
+        )
+        summary = raw.strip()
+        if len(summary) > 420:
+            summary = summary[:417] + "..."
+    except Exception as exc:
+        logger.warning(f"Per-post LLM failed for '{post['title']}': {exc}")
+
+    return CommunityTakeDict(title=post["title"], summary=summary)
+
+
+def build_community_takes(posts: list[RedditPost]) -> list[CommunityTakeDict]:
+    """
+    Fire one focused Gemma call per Reddit post in parallel (max 4 concurrent).
+    Returns a CommunityTakeDict for every post, preserving original order.
+    Falls back to selftext/title if an individual call fails.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not posts:
+        return []
+
+    client    = GeminiClient()
+    team_name = TEAM["name"]
+    subreddit = TEAM["subreddit"]
+
+    results: list[CommunityTakeDict | None] = [None] * len(posts)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        future_to_idx = {
+            pool.submit(_summarize_post, post, client, team_name, subreddit): i
+            for i, post in enumerate(posts)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception as exc:
+                logger.error(f"Community take slot {idx} failed: {exc}")
+                p = posts[idx]
+                results[idx] = CommunityTakeDict(title=p["title"], summary=p["selftext"] or p["title"])
+
+    logger.info(f"Community takes: {len(results)} summaries generated in parallel")
+    return [r for r in results if r is not None]

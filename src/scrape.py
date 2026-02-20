@@ -39,9 +39,19 @@ class RedditComment(TypedDict):
     post:    str   # title of the parent post, for attribution in the UI
 
 
+class RedditPost(TypedDict):
+    title:    str
+    author:   str
+    url:      str
+    age:      str
+    selftext: str         # may be empty for link posts
+    comments: list[str]   # top comment bodies; empty if fetch failed or blocked
+
+
 class RedditData(TypedDict):
     posts_text:   str              # flat text blob for LLM context
-    top_comments: list[RedditComment]  # structured comments for direct rendering
+    top_comments: list[RedditComment]  # kept for fallback rendering
+    posts:        list[RedditPost]     # structured posts for per-card rendering
 
 
 class NewsData(TypedDict):
@@ -104,6 +114,55 @@ def _age_label(created_utc: float) -> str:
         return f"{int(age_hours)}h ago"
     else:
         return f"{int(age_hours / 24)}d ago"
+
+
+# Reddit's public JSON API requires a descriptive User-Agent; generic ones get 429'd.
+_REDDIT_HEADERS = {
+    "User-Agent": "python:bleacher-bot:v1.0.0 (by /u/bleacherbotdev)",
+    "Accept":     "application/json",
+}
+
+
+def _fetch_post_comments(post_url: str, limit: int = REDDIT_COMMENT_LIMIT) -> list[str]:
+    """
+    Fetch the top comments for one Reddit post via the public JSON API.
+    Extracts the post ID from the RSS entry URL and hits:
+      https://www.reddit.com/comments/<id>.json?sort=top
+
+    Returns a list of comment body strings (up to `limit`).
+    Returns [] silently on any error — this is expected on GitHub Actions
+    where Reddit's API is blocked from cloud IP ranges.
+    """
+    import re
+    match = re.search(r"/comments/([a-z0-9]+)/", post_url)
+    if not match:
+        return []
+    post_id  = match.group(1)
+    json_url = f"https://www.reddit.com/comments/{post_id}.json?sort=top&limit={limit * 3}"
+
+    try:
+        resp = requests.get(json_url, headers=_REDDIT_HEADERS, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()   # [post_listing, comment_listing]
+        if len(data) < 2:
+            return []
+
+        comments: list[str] = []
+        for child in data[1]["data"]["children"]:
+            if child.get("kind") != "t1":          # skip "more" items
+                continue
+            cdata  = child.get("data", {})
+            body   = cdata.get("body", "").strip()
+            author = cdata.get("author", "")
+            if body in ("[deleted]", "[removed]", "") or author.lower() == "automoderator":
+                continue
+            comments.append(body[:300])
+            if len(comments) >= limit:
+                break
+        return comments
+    except Exception as exc:
+        logger.debug(f"Comment fetch skipped for {post_url}: {exc}")
+        return []
 
 
 # ── Public scrapers ───────────────────────────────────────────────────────────
@@ -178,7 +237,7 @@ def fetch_reddit_data() -> RedditData:
         feed = feedparser.parse(url)
     except Exception as e:
         logger.error(f"Reddit RSS parse failed: {e}")
-        return RedditData(posts_text="Could not retrieve Reddit data this week.", top_comments=[])
+        return RedditData(posts_text="Could not retrieve Reddit data this week.", top_comments=[], posts=[])
 
     # Filter out AutoModerator/bot posts and take up to the limit
     entries = [
@@ -188,10 +247,11 @@ def fetch_reddit_data() -> RedditData:
 
     if not entries:
         logger.warning(f"No Reddit RSS entries found for r/{subreddit}")
-        return RedditData(posts_text="No Reddit activity found this week.", top_comments=[])
+        return RedditData(posts_text="No Reddit activity found this week.", top_comments=[], posts=[])
 
-    text_lines: list[str]         = []
+    text_lines: list[str]           = []
     top_posts:  list[RedditComment] = []
+    posts:      list[RedditPost]    = []
 
     for entry in entries:
         title  = entry.get("title", "").strip()
@@ -220,8 +280,17 @@ def fetch_reddit_data() -> RedditData:
         text_lines.append(f"  Author: {author}")
         text_lines.append("")
 
-        # Surface posts that have substantive self-text as "community takes"
-        # Posts without selftext (link posts) use the title as the take text
+        # Structured post for per-card rendering (comments filled in below)
+        posts.append(RedditPost(
+            title=title,
+            author=author,
+            url=link,
+            age=age,
+            selftext=snippet,
+            comments=[],
+        ))
+
+        # Keep legacy RedditComment list as fallback
         take_text = snippet if snippet else title
         top_posts.append(RedditComment(
             user=author,
@@ -230,14 +299,42 @@ def fetch_reddit_data() -> RedditData:
             post=title,
         ))
 
-    # Prefer posts with selftext (more discussion-worthy) for the hot takes UI
-    # Posts with a snippet come first; trim to target count
+    # Prefer posts with selftext for the fallback hot-takes UI
     top_posts.sort(key=lambda p: len(p["text"]), reverse=True)
     top_posts = top_posts[:TOP_COMMENTS_TARGET]
 
-    logger.info(f"Reddit RSS: {len(entries)} posts fetched, {len(top_posts)} selected for hot takes")
+    # ── Parallel comment fetch ─────────────────────────────────────────────
+    # Fire one request per post concurrently. Silently skips posts whose URLs
+    # return errors (expected on GitHub Actions where Reddit's JSON API is blocked).
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    return RedditData(posts_text="\n".join(text_lines), top_comments=top_posts)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        future_to_idx = {
+            pool.submit(_fetch_post_comments, posts[i]["url"]): i
+            for i in range(len(posts))
+            if posts[i]["url"]
+        }
+        fetched, skipped = 0, 0
+        for future in as_completed(future_to_idx):
+            idx      = future_to_idx[future]
+            comments = future.result()   # always returns a list, never raises
+            posts[idx]["comments"] = comments
+            if comments:
+                fetched += 1
+                # Append comment text to the flat LLM context blob too
+                text_lines.append(f"  Top comments for: {posts[idx]['title']}")
+                for c in comments:
+                    text_lines.append(f"    > {c[:200]}")
+                text_lines.append("")
+            else:
+                skipped += 1
+
+    logger.info(
+        f"Reddit RSS: {len(entries)} posts fetched — "
+        f"comments: {fetched} posts had data, {skipped} skipped (blocked or link-only)"
+    )
+
+    return RedditData(posts_text="\n".join(text_lines), top_comments=top_posts, posts=posts)
 
 
 def fetch_offseason_news() -> NewsData:

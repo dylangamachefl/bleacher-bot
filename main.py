@@ -21,7 +21,7 @@ logger = logging.getLogger("bleacher-bot")
 
 from src.config import TEAM, DRY_RUN
 from src.scrape import fetch_general_news, fetch_reddit_data, fetch_offseason_news
-from src.compose import build_report
+from src.compose import build_report, build_community_takes
 from src.deliver import render_report, send_email
 
 
@@ -45,7 +45,7 @@ def main() -> int:
         logger.info(f"  ✓ Reddit — {len(reddit_data['top_comments'])} top comments collected")
     except Exception as e:
         logger.error(f"  ✗ Reddit fetch failed: {e}")
-        reddit_data = {"posts_text": "Could not retrieve Reddit data this week.", "top_comments": []}
+        reddit_data = {"posts_text": "Could not retrieve Reddit data this week.", "top_comments": [], "posts": []}
 
     try:
         offseason_news = fetch_offseason_news()
@@ -54,18 +54,28 @@ def main() -> int:
         logger.error(f"  ✗ Offseason news failed: {e}")
         offseason_news = {"items": [], "text_blob": "Could not retrieve offseason news this week."}
 
-    # ── Step 2: Compose (single LLM call → ReportData) ────────────────────
-    logger.info("Composing report (LLM analysis)...")
+    # ── Step 2: Compose ────────────────────────────────────────────────────
+    # 2a. Main LLM call — sentiment, executive summary, war room
+    logger.info("Composing report (main LLM analysis)...")
     try:
         report = build_report(
             general_news=general_news,
             reddit_data=reddit_data,
             offseason_news=offseason_news,
         )
-        logger.info("  ✓ Report data composed")
+        logger.info("  ✓ Main report composed")
     except Exception as e:
         logger.error(f"Report composition failed: {e}")
         return 1
+
+    # 2b. Per-post community takes — one parallel Gemma call per Reddit post
+    logger.info(f"Generating community takes ({len(reddit_data['posts'])} posts, parallel)...")
+    try:
+        report["community_takes"] = build_community_takes(reddit_data["posts"])
+        logger.info(f"  ✓ Community takes: {len(report['community_takes'])} summaries")
+    except Exception as e:
+        logger.error(f"Community takes generation failed: {e}")
+        # non-fatal — report renders with empty community takes
 
     # ── Step 3: Render (data → HTML) ───────────────────────────────────────
     logger.info("Rendering HTML report...")
