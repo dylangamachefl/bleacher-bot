@@ -58,20 +58,33 @@ def _markdown_to_html(md: str) -> str:
     masthead_lines: list[str] = []
     content_lines: list[str] = []
     in_card = False
+    in_ul = False       # tracking whether we're inside an open <ul>
+    in_blockquote = False  # tracking whether we're inside an open <blockquote>
     zone = "masthead"
+
+    def _close_open_blocks() -> None:
+        """Close any open list or blockquote before emitting a non-list/quote line."""
+        nonlocal in_ul, in_blockquote
+        if in_ul:
+            content_lines.append("</ul>")
+            in_ul = False
+        if in_blockquote:
+            content_lines.append("</blockquote>")
+            in_blockquote = False
 
     for line in main_md.split("\n"):
         s = line.strip()
 
         if s.startswith("# "):
+            _close_open_blocks()
             masthead_lines.append(f'<h1>{s[2:]}</h1>')
             zone = "masthead"
 
         elif s.startswith("### ") and zone == "masthead":
-            # Date line sits beneath the title in the masthead
             masthead_lines.append(f'<p class="date">{s[4:]}</p>')
 
         elif s.startswith("## "):
+            _close_open_blocks()
             zone = "content"
             if in_card:
                 content_lines.append("</div>")
@@ -79,18 +92,45 @@ def _markdown_to_html(md: str) -> str:
             in_card = True
 
         elif s.startswith("### "):
+            _close_open_blocks()
             content_lines.append(f'<h3>{s[4:]}</h3>')
 
+        elif s.startswith("- ") and zone == "content":
+            # Bullet list item — open <ul> if not already inside one
+            if in_blockquote:
+                content_lines.append("</blockquote>")
+                in_blockquote = False
+            if not in_ul:
+                content_lines.append("<ul>")
+                in_ul = True
+            content_lines.append(f"<li>{_inline_markup(s[2:])}</li>")
+
+        elif s.startswith("> ") and zone == "content":
+            # Blockquote line — open <blockquote> if not already inside one
+            if in_ul:
+                content_lines.append("</ul>")
+                in_ul = False
+            if not in_blockquote:
+                content_lines.append('<blockquote>')
+                in_blockquote = True
+            content_lines.append(f"<p>{_inline_markup(s[2:])}</p>")
+
         elif s in ("---", ""):
-            pass  # Card layout replaces dividers; CSS margins replace blank lines
+            # A blank line closes an open blockquote (signals end of quote + attribution)
+            # but not a list (lists can have blank lines between items from the LLM)
+            if in_blockquote:
+                content_lines.append("</blockquote>")
+                in_blockquote = False
 
         else:
+            _close_open_blocks()
             text = _inline_markup(s)
             if zone == "masthead":
                 masthead_lines.append(f"<p>{text}</p>")
             else:
                 content_lines.append(f"<p>{text}</p>")
 
+    _close_open_blocks()
     if in_card:
         content_lines.append("</div>")
 
@@ -202,6 +242,51 @@ def _markdown_to_html(md: str) -> str:
     }}
     .card em {{
       font-style: italic;
+      color: var(--text-muted);
+    }}
+
+    /* ── Bullet lists (War Room) ─────────────────────────────────── */
+    .card ul {{
+      margin: 10px 0 0 0;
+      padding: 0;
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }}
+    .card li {{
+      font-size: 0.97rem;
+      line-height: 1.65;
+      color: var(--text);
+      padding-left: 16px;
+      position: relative;
+    }}
+    .card li::before {{
+      content: "–";
+      position: absolute;
+      left: 0;
+      color: var(--orange);
+      font-weight: 600;
+    }}
+
+    /* ── Blockquotes (Watercooler fan takes) ─────────────────────── */
+    .card blockquote {{
+      margin: 14px 0;
+      padding: 12px 16px;
+      border-left: 3px solid var(--orange);
+      background: #FFF8F5;
+      border-radius: 0 6px 6px 0;
+    }}
+    .card blockquote p {{
+      font-size: 0.95rem;
+      line-height: 1.7;
+      color: var(--text);
+      font-style: italic;
+    }}
+    .card blockquote p + p {{
+      margin-top: 4px;
+      font-style: normal;
+      font-size: 0.82rem;
       color: var(--text-muted);
     }}
 
